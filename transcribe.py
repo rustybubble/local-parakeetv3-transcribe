@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local MKV/video transcription using NVIDIA Parakeet v3."""
 
+import contextlib
 import json
 import os
 import subprocess
@@ -136,35 +137,69 @@ def transcribe_file(model, src: Path, out_dir: Path, formats: list, verbose: boo
         print(f"  -> {out}")
 
 
+@contextlib.contextmanager
+def _tolerant_tempdir_cleanup():
+    """Make tempfile.TemporaryDirectory tolerate cleanup failures on Windows.
+
+    NeMo's transcribe() writes a dataloader manifest.json into a
+    TemporaryDirectory that it manages internally. On Windows the file handle
+    isn't always released by the time __exit__ runs, so cleanup raises
+    WinError 32 — and because that happens *inside* NeMo's `with` block, the
+    transcription result is destroyed along with the exception. For a long
+    job (e.g. a 90-min file) that means hours of work lost at the very end.
+
+    Patching tempfile.TemporaryDirectory for the duration of the call lets
+    NeMo finish and return; any leaked temp dir is small (just the manifest)
+    and Windows cleans %TEMP% periodically.
+    """
+    if os.name != 'nt':
+        yield
+        return
+
+    original = tempfile.TemporaryDirectory
+
+    class _IgnoreCleanupTempDir(original):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault('ignore_cleanup_errors', True)
+            super().__init__(*args, **kwargs)
+
+    tempfile.TemporaryDirectory = _IgnoreCleanupTempDir
+    try:
+        yield
+    finally:
+        tempfile.TemporaryDirectory = original
+
+
 def _run_transcription(model, wav: Path) -> list:
     """Return a list of segment dicts: {start, end, text}."""
     # num_workers=0 avoids spawning dataloader subprocesses, which on Windows
     # can leave manifest.json file handles locked and break repeated runs
     # (the long-lived web server hits this; the one-shot CLI usually doesn't).
-    try:
-        output = model.transcribe([str(wav)], timestamps=True, num_workers=0)
-        result = output[0]
-        text = result.text if hasattr(result, 'text') else str(result)
+    with _tolerant_tempdir_cleanup():
+        try:
+            output = model.transcribe([str(wav)], timestamps=True, num_workers=0)
+            result = output[0]
+            text = result.text if hasattr(result, 'text') else str(result)
 
-        if hasattr(result, 'timestamp') and result.timestamp:
-            raw = result.timestamp.get('segment', [])
-            if raw:
-                return [
-                    {
-                        'start': round(seg['start'], 3),
-                        'end':   round(seg['end'],   3),
-                        'text':  seg['segment']
-                    }
-                    for seg in raw
-                ]
-        # Timestamps not available — return single block
-        return [{'start': 0.0, 'end': 0.0, 'text': text}]
+            if hasattr(result, 'timestamp') and result.timestamp:
+                raw = result.timestamp.get('segment', [])
+                if raw:
+                    return [
+                        {
+                            'start': round(seg['start'], 3),
+                            'end':   round(seg['end'],   3),
+                            'text':  seg['segment']
+                        }
+                        for seg in raw
+                    ]
+            # Timestamps not available — return single block
+            return [{'start': 0.0, 'end': 0.0, 'text': text}]
 
-    except Exception:
-        # Fallback: transcribe without timestamps
-        output = model.transcribe([str(wav)], num_workers=0)
-        text = output[0] if isinstance(output[0], str) else output[0].text
-        return [{'start': 0.0, 'end': 0.0, 'text': text}]
+        except Exception:
+            # Fallback: transcribe without timestamps
+            output = model.transcribe([str(wav)], num_workers=0)
+            text = output[0] if isinstance(output[0], str) else output[0].text
+            return [{'start': 0.0, 'end': 0.0, 'text': text}]
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

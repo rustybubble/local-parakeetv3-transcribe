@@ -1,7 +1,7 @@
 @echo off
-REM Launcher for the local Parakeet v3 transcription web app.
+REM Launcher for the local faster-whisper transcription web app.
 REM
-REM First run: starts the server, loads the model (~30s), opens the browser.
+REM First run: starts the server, loads the model (~10s), opens the browser.
 REM Subsequent runs while the server window is still open: just opens the browser
 REM (no model reload). Close this window or press Ctrl+C to stop the server.
 
@@ -15,8 +15,8 @@ if %errorlevel%==0 (
   exit /b 0
 )
 
-echo Starting Parakeet v3 transcription server...
-echo The browser tab will open in a second; the model loads in the background (~30s).
+echo Starting Whisper transcription server...
+echo The browser tab will open in a second; the model loads in the background (~10s).
 echo.
 echo Leave this window open while you use the app.
 echo Re-running run.bat while it's open just reopens the browser (no model reload).

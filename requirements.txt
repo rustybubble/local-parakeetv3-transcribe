@@ -1,2 +1,2 @@
-faster-whisper
+pywhispercpp>=1.4
 flask

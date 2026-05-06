@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local MKV/video transcription using faster-whisper (Whisper on CTranslate2)."""
+"""Local MKV/video transcription using whisper.cpp (via pywhispercpp)."""
 
 import json
 import subprocess
@@ -13,9 +13,17 @@ SUPPORTED = {'.mkv', '.mp4', '.avi', '.mov', '.webm', '.m4v',
 
 VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.mov', '.webm', '.m4v'}
 
-# small (244M, multilingual) is the speed/accuracy sweet spot for laptop CPU:
-# ~3-5x realtime with INT8, auto-detects language. Override with --model.
-DEFAULT_MODEL = "small"
+# small-q5_1: ~150 MB, multilingual, q5_1-quantized. On a modern laptop CPU
+# this hits ~5-8x realtime — meaningfully faster than the f16 small with
+# essentially no accuracy hit. Override with --model on the CLI; see the
+# README for the full menu (tiny/base/small/medium/large-v3, plus quantized
+# and English-only variants).
+DEFAULT_MODEL = "small-q5_1"
+
+# Keep the model cache next to the project so the install is self-contained
+# (pywhispercpp's default cache lives in %LOCALAPPDATA% / ~/.local/share,
+# which is fine but harder to find or back up).
+MODELS_DIR = Path(__file__).parent / "models"
 
 
 def check_ffmpeg():
@@ -86,16 +94,24 @@ WRITERS = {'txt': write_txt, 'srt': write_srt, 'vtt': write_vtt, 'json': write_j
 
 # ── Model loading ────────────────────────────────────────────────────────────
 
-def load_model(model_name: str = DEFAULT_MODEL, compute_type: str = "int8"):
+def load_model(model_name: str = DEFAULT_MODEL):
     try:
-        from faster_whisper import WhisperModel
+        from pywhispercpp.model import Model
     except ImportError:
-        print("ERROR: faster-whisper not installed.")
-        print("  Run: pip install faster-whisper")
+        print("ERROR: pywhispercpp not installed.")
+        print("  Run: pip install pywhispercpp")
         sys.exit(1)
 
-    print(f"Loading model: {model_name}  (first run downloads from HuggingFace)")
-    return WhisperModel(model_name, device="cpu", compute_type=compute_type)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Loading model: {model_name}  (first run downloads from HuggingFace into ./models)")
+    # print_progress / print_realtime would spam stdout from inside whisper.cpp;
+    # we get the same info via the streaming segment callback in _run_transcription.
+    return Model(
+        model_name,
+        models_dir=str(MODELS_DIR),
+        print_progress=False,
+        print_realtime=False,
+    )
 
 
 # ── Core transcription ───────────────────────────────────────────────────────
@@ -118,7 +134,7 @@ def transcribe_file(model, src: Path, out_dir: Path, formats: list, verbose: boo
         if verbose:
             def _on_seg(seg):
                 label = f"[{seg['start']:.1f}s] " if seg['start'] else ""
-                print(f"    {label}{seg['text'].strip()}")
+                print(f"    {label}{seg['text'].strip()}", flush=True)
             segs = _run_transcription(model, wav, on_segment=_on_seg)
         else:
             segs = _run_transcription(model, wav)
@@ -133,55 +149,50 @@ def transcribe_file(model, src: Path, out_dir: Path, formats: list, verbose: boo
 def _run_transcription(model, wav: Path, progress=None, on_segment=None) -> list:
     """Return a list of segment dicts: {start, end, text}.
 
-    faster-whisper returns a generator — iterating is what actually drives
-    inference. We collect into a list so the rest of the pipeline can work
-    with it.
+    whisper.cpp emits segments through a streaming callback as inference
+    runs. Each Segment carries t0/t1 in 10ms units (centiseconds) — we
+    divide by 100 to get seconds.
 
-    ``progress(audio_seconds_done)``: optional callback invoked after each
-    segment with how much audio (in seconds) has been processed. The web
-    UI uses this for a real progress bar instead of a constant-time guess.
-
-    ``on_segment(seg_dict)``: optional callback invoked with each segment
-    as it arrives — used by the CLI's --verbose mode to print live.
+    ``progress(audio_seconds_done)`` and ``on_segment(seg_dict)`` are
+    optional callbacks the web UI / CLI use for live feedback.
     """
-    segments_iter, _info = model.transcribe(
-        str(wav),
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
-    segs = []
-    for s in segments_iter:
-        seg = {
-            'start': round(s.start, 3),
-            'end':   round(s.end, 3),
-            'text':  s.text.strip(),
+    captured: list = []
+
+    def cb(seg):
+        d = {
+            'start': round(seg.t0 / 100.0, 3),
+            'end':   round(seg.t1 / 100.0, 3),
+            'text':  seg.text.strip(),
         }
-        segs.append(seg)
+        captured.append(d)
         if on_segment is not None:
-            on_segment(seg)
+            on_segment(d)
         if progress is not None:
-            progress(s.end)
-    return segs
+            progress(d['end'])
+
+    model.transcribe(str(wav), new_segment_callback=cb)
+    return captured
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Transcribe MKV/video files locally with faster-whisper.',
+        description='Transcribe MKV/video files locally with whisper.cpp.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Models (multilingual — auto-detect language):
-  tiny      ~75 MB    fastest, lowest accuracy
-  base      ~140 MB
-  small     ~470 MB   good speed/accuracy balance [default]
-  medium    ~1.5 GB   slower, more accurate
-  large-v3  ~3 GB     most accurate, slow on CPU
+Models (multilingual unless suffixed .en — auto-detect language):
+  tiny / tiny.en        ~75 MB     fastest, lowest accuracy
+  base / base.en        ~140 MB
+  small / small.en      ~470 MB    good balance
+  medium / medium.en    ~1.5 GB    slower, more accurate
+  large-v3              ~3 GB      most accurate, slow on CPU
+  large-v3-turbo        ~1.6 GB    near-large quality, faster
 
-English-only (smaller / a bit faster on English speech):
-  tiny.en, base.en, small.en, medium.en
-  distil-large-v3   ~1.5 GB, distilled large-v3, English
+Quantized variants (recommended on CPU — append to any name above):
+  -q5_1   smallest, ~negligible accuracy loss          (default: small-q5_1)
+  -q8_0   slightly larger, slightly more accurate
+  e.g. small-q5_1, medium-q8_0, large-v3-turbo-q5_0, small.en-q5_1
 
 Output formats:
   txt   Plain text transcript
@@ -193,8 +204,8 @@ Examples:
   python transcribe.py lecture.mkv
   python transcribe.py meeting.mkv --format srt vtt txt
   python transcribe.py recordings/ --output ./transcripts
-  python transcribe.py lecture.mkv --model medium
-  python transcribe.py lecture.mkv --model distil-large-v3
+  python transcribe.py lecture.mkv --model medium-q5_0
+  python transcribe.py lecture.mkv --model small.en-q5_1
         """
     )
     parser.add_argument('inputs', nargs='+',
@@ -206,10 +217,7 @@ Examples:
                         metavar='FMT',
                         help='Output format(s) — txt srt vtt json (default: txt srt)')
     parser.add_argument('--model', '-m', default=DEFAULT_MODEL,
-                        help='Whisper model name (see Models above)')
-    parser.add_argument('--compute-type', default='int8',
-                        choices=['int8', 'int8_float32', 'float32'],
-                        help='Compute precision (int8 is fastest on CPU; default)')
+                        help=f'Whisper model name (default: {DEFAULT_MODEL})')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print each segment as it is produced')
     args = parser.parse_args()
@@ -235,7 +243,7 @@ Examples:
         sys.exit(1)
 
     print(f"\nFiles to transcribe: {len(files)}")
-    model = load_model(args.model, args.compute_type)
+    model = load_model(args.model)
 
     ok, failed = 0, []
     for f in files:

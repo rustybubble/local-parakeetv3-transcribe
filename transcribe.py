@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Local MKV/video transcription using NVIDIA Parakeet v3."""
+"""Local MKV/video transcription using whisper.cpp (via pywhispercpp)."""
 
-import contextlib
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -14,6 +12,18 @@ SUPPORTED = {'.mkv', '.mp4', '.avi', '.mov', '.webm', '.m4v',
              '.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac'}
 
 VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.mov', '.webm', '.m4v'}
+
+# small-q5_1: ~150 MB, multilingual, q5_1-quantized. On a modern laptop CPU
+# this hits ~5-8x realtime — meaningfully faster than the f16 small with
+# essentially no accuracy hit. Override with --model on the CLI; see the
+# README for the full menu (tiny/base/small/medium/large-v3, plus quantized
+# and English-only variants).
+DEFAULT_MODEL = "small-q5_1"
+
+# Keep the model cache next to the project so the install is self-contained
+# (pywhispercpp's default cache lives in %LOCALAPPDATA% / ~/.local/share,
+# which is fine but harder to find or back up).
+MODELS_DIR = Path(__file__).parent / "models"
 
 
 def check_ffmpeg():
@@ -26,12 +36,12 @@ def check_ffmpeg():
 
 
 def extract_audio(src: Path, dst: Path):
-    """Convert any audio/video file to 16 kHz mono PCM WAV for Parakeet."""
+    """Convert any audio/video file to 16 kHz mono PCM WAV (Whisper's native format)."""
     subprocess.run([
         'ffmpeg', '-y', '-i', str(src),
         '-vn',                  # strip video
         '-ac', '1',             # mono
-        '-ar', '16000',         # 16 kHz sample rate required by Parakeet
+        '-ar', '16000',         # 16 kHz sample rate
         '-acodec', 'pcm_s16le', # 16-bit PCM
         str(dst)
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -84,26 +94,24 @@ WRITERS = {'txt': write_txt, 'srt': write_srt, 'vtt': write_vtt, 'json': write_j
 
 # ── Model loading ────────────────────────────────────────────────────────────
 
-def load_model(model_name: str, long_audio: bool):
+def load_model(model_name: str = DEFAULT_MODEL):
     try:
-        import nemo.collections.asr as nemo_asr
+        from pywhispercpp.model import Model
     except ImportError:
-        print("ERROR: NeMo ASR not installed.")
-        print("  Run: pip install nemo_toolkit[asr]")
+        print("ERROR: pywhispercpp not installed.")
+        print("  Run: pip install pywhispercpp")
         sys.exit(1)
 
-    print(f"Loading model: {model_name}  (first run downloads ~600 MB)")
-    model = nemo_asr.models.ASRModel.from_pretrained(model_name)
-
-    if long_audio:
-        # Local attention keeps VRAM usage flat for recordings longer than ~15 min
-        print("Long-audio mode: switching to local attention...")
-        model.change_attention_model(
-            self_attention_model="rel_pos_local_attn",
-            att_context_size=[256, 256]
-        )
-
-    return model
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Loading model: {model_name}  (first run downloads from HuggingFace into ./models)")
+    # print_progress / print_realtime would spam stdout from inside whisper.cpp;
+    # we get the same info via the streaming segment callback in _run_transcription.
+    return Model(
+        model_name,
+        models_dir=str(MODELS_DIR),
+        print_progress=False,
+        print_realtime=False,
+    )
 
 
 # ── Core transcription ───────────────────────────────────────────────────────
@@ -112,7 +120,7 @@ def transcribe_file(model, src: Path, out_dir: Path, formats: list, verbose: boo
     print(f"\n[{src.name}]")
 
     with tempfile.TemporaryDirectory() as tmp:
-        if src.suffix.lower() in VIDEO_EXTS or src.suffix.lower() != '.wav':
+        if src.suffix.lower() != '.wav':
             wav = Path(tmp) / 'audio.wav'
             print("  Extracting audio...")
             try:
@@ -123,12 +131,13 @@ def transcribe_file(model, src: Path, out_dir: Path, formats: list, verbose: boo
             wav = src
 
         print("  Transcribing...")
-        segs = _run_transcription(model, wav)
-
-    if verbose:
-        for s in segs:
-            label = f"[{s['start']:.1f}s] " if s['start'] else ""
-            print(f"    {label}{s['text'].strip()}")
+        if verbose:
+            def _on_seg(seg):
+                label = f"[{seg['start']:.1f}s] " if seg['start'] else ""
+                print(f"    {label}{seg['text'].strip()}", flush=True)
+            segs = _run_transcription(model, wav, on_segment=_on_seg)
+        else:
+            segs = _run_transcription(model, wav)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for fmt in formats:
@@ -137,81 +146,53 @@ def transcribe_file(model, src: Path, out_dir: Path, formats: list, verbose: boo
         print(f"  -> {out}")
 
 
-@contextlib.contextmanager
-def _tolerant_tempdir_cleanup():
-    """Make tempfile.TemporaryDirectory tolerate cleanup failures on Windows.
+def _run_transcription(model, wav: Path, progress=None, on_segment=None) -> list:
+    """Return a list of segment dicts: {start, end, text}.
 
-    NeMo's transcribe() writes a dataloader manifest.json into a
-    TemporaryDirectory that it manages internally. On Windows the file handle
-    isn't always released by the time __exit__ runs, so cleanup raises
-    WinError 32 — and because that happens *inside* NeMo's `with` block, the
-    transcription result is destroyed along with the exception. For a long
-    job (e.g. a 90-min file) that means hours of work lost at the very end.
+    whisper.cpp emits segments through a streaming callback as inference
+    runs. Each Segment carries t0/t1 in 10ms units (centiseconds) — we
+    divide by 100 to get seconds.
 
-    Patching tempfile.TemporaryDirectory for the duration of the call lets
-    NeMo finish and return; any leaked temp dir is small (just the manifest)
-    and Windows cleans %TEMP% periodically.
+    ``progress(audio_seconds_done)`` and ``on_segment(seg_dict)`` are
+    optional callbacks the web UI / CLI use for live feedback.
     """
-    if os.name != 'nt':
-        yield
-        return
+    captured: list = []
 
-    original = tempfile.TemporaryDirectory
+    def cb(seg):
+        d = {
+            'start': round(seg.t0 / 100.0, 3),
+            'end':   round(seg.t1 / 100.0, 3),
+            'text':  seg.text.strip(),
+        }
+        captured.append(d)
+        if on_segment is not None:
+            on_segment(d)
+        if progress is not None:
+            progress(d['end'])
 
-    class _IgnoreCleanupTempDir(original):
-        def __init__(self, *args, **kwargs):
-            kwargs.setdefault('ignore_cleanup_errors', True)
-            super().__init__(*args, **kwargs)
-
-    tempfile.TemporaryDirectory = _IgnoreCleanupTempDir
-    try:
-        yield
-    finally:
-        tempfile.TemporaryDirectory = original
-
-
-def _run_transcription(model, wav: Path) -> list:
-    """Return a list of segment dicts: {start, end, text}."""
-    # num_workers=0 avoids spawning dataloader subprocesses, which on Windows
-    # can leave manifest.json file handles locked and break repeated runs
-    # (the long-lived web server hits this; the one-shot CLI usually doesn't).
-    with _tolerant_tempdir_cleanup():
-        try:
-            output = model.transcribe([str(wav)], timestamps=True, num_workers=0)
-            result = output[0]
-            text = result.text if hasattr(result, 'text') else str(result)
-
-            if hasattr(result, 'timestamp') and result.timestamp:
-                raw = result.timestamp.get('segment', [])
-                if raw:
-                    return [
-                        {
-                            'start': round(seg['start'], 3),
-                            'end':   round(seg['end'],   3),
-                            'text':  seg['segment']
-                        }
-                        for seg in raw
-                    ]
-            # Timestamps not available — return single block
-            return [{'start': 0.0, 'end': 0.0, 'text': text}]
-
-        except Exception:
-            # Fallback: transcribe without timestamps
-            output = model.transcribe([str(wav)], num_workers=0)
-            text = output[0] if isinstance(output[0], str) else output[0].text
-            return [{'start': 0.0, 'end': 0.0, 'text': text}]
+    model.transcribe(str(wav), new_segment_callback=cb)
+    return captured
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Transcribe MKV/video files locally with NVIDIA Parakeet v3.',
+        description='Transcribe MKV/video files locally with whisper.cpp.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Models:
-  nvidia/parakeet-tdt-0.6b-v3   600 M params, 25 languages, auto-detects language [default]
-  nvidia/parakeet-tdt-1.1b      1.1 B params, English only, slightly more accurate
+Models (multilingual unless suffixed .en — auto-detect language):
+  tiny / tiny.en        ~75 MB     fastest, lowest accuracy
+  base / base.en        ~140 MB
+  small / small.en      ~470 MB    good balance
+  medium / medium.en    ~1.5 GB    slower, more accurate
+  large-v3              ~3 GB      most accurate, slow on CPU
+  large-v3-turbo        ~1.6 GB    near-large quality, faster
+
+Quantized variants (recommended on CPU — append to any name above):
+  -q5_1   smallest, ~negligible accuracy loss          (default: small-q5_1)
+  -q8_0   slightly larger, slightly more accurate
+  e.g. small-q5_1, medium-q8_0, large-v3-turbo-q5_0, small.en-q5_1
 
 Output formats:
   txt   Plain text transcript
@@ -223,8 +204,8 @@ Examples:
   python transcribe.py lecture.mkv
   python transcribe.py meeting.mkv --format srt vtt txt
   python transcribe.py recordings/ --output ./transcripts
-  python transcribe.py long_lecture.mkv --long
-  python transcribe.py lecture.mkv --model nvidia/parakeet-tdt-1.1b
+  python transcribe.py lecture.mkv --model medium-q5_0
+  python transcribe.py lecture.mkv --model small.en-q5_1
         """
     )
     parser.add_argument('inputs', nargs='+',
@@ -235,10 +216,8 @@ Examples:
                         choices=['txt', 'srt', 'vtt', 'json'], default=['txt', 'srt'],
                         metavar='FMT',
                         help='Output format(s) — txt srt vtt json (default: txt srt)')
-    parser.add_argument('--model', '-m', default='nvidia/parakeet-tdt-0.6b-v3',
-                        help='Parakeet model to use (see Models above)')
-    parser.add_argument('--long', '-l', action='store_true',
-                        help='Long-audio mode for recordings over ~15 min (reduces VRAM)')
+    parser.add_argument('--model', '-m', default=DEFAULT_MODEL,
+                        help=f'Whisper model name (default: {DEFAULT_MODEL})')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print each segment as it is produced')
     args = parser.parse_args()
@@ -264,7 +243,7 @@ Examples:
         sys.exit(1)
 
     print(f"\nFiles to transcribe: {len(files)}")
-    model = load_model(args.model, args.long)
+    model = load_model(args.model)
 
     ok, failed = 0, []
     for f in files:

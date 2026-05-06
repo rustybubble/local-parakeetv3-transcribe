@@ -1,4 +1,4 @@
-"""Local web UI for Parakeet v3 transcription.
+"""Local web UI for whisper.cpp transcription.
 
 Run with:  python app.py
 Then open: http://127.0.0.1:5000
@@ -35,10 +35,10 @@ ALLOWED = {
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac",
 }
 
-# CPU transcription on this box runs at ~0.2x real time (memory: 18 min in 3:30).
-# Use 0.25 as a slightly conservative estimate so the bar lands a bit early
-# rather than overshooting and stalling at 99%.
-CPU_TRANSCRIBE_RATIO = 0.25
+# Initial ETA guess until streaming progress kicks in. whisper.cpp small-q5_1
+# on a typical laptop CPU runs ~0.05-0.1x realtime; 0.12 keeps the bar from
+# overshooting, then observed throughput refines the estimate live.
+CPU_TRANSCRIBE_RATIO = 0.12
 MIN_ESTIMATE_SEC = 15.0
 
 app = Flask(__name__)
@@ -56,8 +56,8 @@ def get_model():
     global _model
     with _model_lock:
         if _model is None:
-            print("Loading Parakeet v3 (long-audio mode)...", flush=True)
-            _model = load_model("nvidia/parakeet-tdt-0.6b-v3", long_audio=True)
+            print("Loading whisper.cpp (small-q5_1)...", flush=True)
+            _model = load_model()
             _model_ready.set()
             print(f"Model loaded in {time.time() - _model_load_started:.1f}s.", flush=True)
     return _model
@@ -115,7 +115,7 @@ def _run_job(job_id: str, src: Path):
         with _job_lock:
             if not _model_ready.is_set():
                 _set_stage(job, "loading_model",
-                           "Loading model (one-time, ~30s on first start)...")
+                           "Loading model (first run downloads ~150 MB)...")
             model = get_model()  # blocks until the background loader finishes
 
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -131,12 +131,28 @@ def _run_job(job_id: str, src: Path):
                 mins = audio_dur / 60
                 _set_stage(
                     job, "transcribing",
-                    f"Transcribing {mins:.1f} min of audio with Parakeet v3...",
+                    f"Transcribing {mins:.1f} min of audio with whisper.cpp...",
                     estimated_total_sec=estimate,
                 )
                 print(f"[{job_id}] Transcribing {mins:.1f} min "
-                      f"(estimated ~{estimate:.0f}s on CPU)...", flush=True)
-                segs = _run_transcription(model, wav)
+                      f"(initial estimate ~{estimate:.0f}s on CPU)...", flush=True)
+
+                # Refine the ETA from observed throughput. Wait until ~30s of
+                # audio has been processed so model warmup doesn't skew the
+                # rate. With estimated = elapsed * (audio_total / audio_done),
+                # the frontend's `elapsed / estimated` reduces to
+                # `audio_done / audio_total` — so the bar shows real audio
+                # progress for free.
+                stage_started = job["stage_started"]
+                def on_progress(audio_done: float):
+                    job["audio_seconds_done"] = round(audio_done, 1)
+                    if audio_done >= 30 and audio_dur > 0:
+                        elapsed = time.time() - stage_started
+                        rate = elapsed / audio_done       # wallclock per audio sec
+                        refined = max(MIN_ESTIMATE_SEC, rate * audio_dur)
+                        job["estimated_total_sec"] = round(refined, 1)
+
+                segs = _run_transcription(model, wav, progress=on_progress)
 
             _set_stage(job, "writing", "Writing transcript files...")
             stem = Path(job["filename"]).stem or f"transcript_{job_id}"

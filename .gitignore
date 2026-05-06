@@ -12,6 +12,9 @@ env/
 # App runtime output
 transcripts/
 
+# whisper.cpp model cache (downloaded on first run)
+models/
+
 # Media files — this is a transcription tool, so test recordings live here
 # but should never be checked in
 *.mkv

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Local Parakeet v3 Transcribe</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      background: #0e0f14; color: #e3e6ec;
+      max-width: 780px; margin: 40px auto; padding: 0 20px 80px;
+      line-height: 1.5;
+    }
+    h1 { font-weight: 600; margin-bottom: 4px; font-size: 24px; }
+    h2 { font-weight: 600; font-size: 18px; margin-top: 30px; }
+    p.sub { color: #8a93a4; margin-top: 0; font-size: 14px; }
+
+    .drop {
+      border: 2px dashed #3a4150; border-radius: 12px;
+      padding: 38px 20px; text-align: center;
+      transition: border-color .15s, background .15s;
+      position: relative;
+    }
+    .drop.hover { border-color: #6aa9ff; background: #15213a; }
+    .drop label { display: block; cursor: pointer; }
+    .drop input { display: none; }
+    .file { margin-top: 10px; color: #aab2c0; font-size: 13px; }
+
+    button {
+      background: #4a8eff; color: #fff; border: 0;
+      padding: 11px 22px; border-radius: 8px;
+      cursor: pointer; font-weight: 600; font-size: 14px;
+      margin-top: 16px; transition: background .15s;
+    }
+    button:hover:not(:disabled) { background: #649dff; }
+    button:disabled { background: #3a4150; cursor: not-allowed; color: #6e7585; }
+
+    .status {
+      margin-top: 20px; padding: 14px 16px;
+      background: #161922; border-radius: 8px;
+      border-left: 3px solid #4a8eff;
+      font-size: 14px;
+    }
+    .status.err { border-left-color: #ff5252; color: #ff8a8a; }
+    .status.done { border-left-color: #4ade80; }
+
+    .status-line { display: flex; align-items: center; gap: 8px; }
+    .status-line .label { flex: 1; }
+
+    .progress-bar {
+      height: 6px; background: #1d212c; border-radius: 3px;
+      margin-top: 12px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; background: linear-gradient(90deg, #4a8eff, #6aa9ff);
+      width: 0%; transition: width .4s ease;
+      border-radius: 3px;
+    }
+    .progress-fill.indeterminate {
+      width: 35% !important;
+      animation: indet 1.4s ease-in-out infinite;
+    }
+    @keyframes indet {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(285%); }
+    }
+    .status.done .progress-fill { background: #4ade80; }
+    .status.err  .progress-fill { background: #ff5252; }
+
+    .progress-meta {
+      color: #8a93a4; font-size: 12px; margin-top: 8px;
+      display: flex; justify-content: space-between; gap: 12px;
+    }
+    .progress-meta .left  { color: #aab2c0; }
+    .progress-meta .right { color: #8a93a4; }
+
+    pre {
+      background: #0a0b10; padding: 16px; border-radius: 8px;
+      max-height: 480px; overflow: auto;
+      white-space: pre-wrap; word-wrap: break-word;
+      font-size: 13px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+      border: 1px solid #1d212c;
+    }
+
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    .row a {
+      background: #1d212c; color: #e3e6ec;
+      padding: 8px 14px; border-radius: 6px;
+      text-decoration: none; font-size: 13px;
+      border: 1px solid #2a3140; transition: background .15s;
+    }
+    .row a:hover { background: #2a3140; }
+
+    .spinner {
+      display: inline-block; width: 12px; height: 12px;
+      border: 2px solid currentColor; border-top-color: transparent;
+      border-radius: 50%; animation: spin .8s linear infinite;
+      vertical-align: -1px; opacity: .8; flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .ready-pill {
+      display: inline-flex; align-items: center;
+      font-size: 12px; color: #aab2c0;
+      background: #161922; border: 1px solid #2a3140;
+      padding: 4px 10px; border-radius: 999px;
+      margin-left: 10px; vertical-align: 2px;
+    }
+    .ready-pill.ok { color: #4ade80; border-color: #1f3826; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+           margin-right: 6px; opacity: .9; }
+    .ready-pill .dot { animation: pulse 1.4s ease-in-out infinite; }
+    .ready-pill.ok .dot { animation: none; }
+    @keyframes pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+  </style>
+</head>
+<body>
+  <h1>Local Parakeet v3 Transcribe<span id="readyPill" class="ready-pill"><span class="dot"></span><span id="readyText">model warming up…</span></span></h1>
+  <p class="sub">Drop an MKV, MP4, MP3, or any audio/video file. Runs offline using NVIDIA Parakeet TDT 0.6B v3.</p>
+
+  <div class="drop" id="drop">
+    <label for="file">
+      <div id="dropMsg">Drag &amp; drop a file here, or click to choose</div>
+      <div class="file" id="fileName"></div>
+    </label>
+    <input type="file" id="file"
+           accept=".mkv,.mp4,.mov,.avi,.webm,.m4v,.mp3,.wav,.m4a,.flac,.ogg,.aac">
+  </div>
+  <button id="go" type="button" disabled>Transcribe</button>
+
+  <div id="status" class="status" style="display:none">
+    <div class="status-line">
+      <span class="spinner" id="spinner"></span>
+      <span class="label" id="progressMsg">...</span>
+    </div>
+    <div class="progress-bar" id="progressBar" style="display:none">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="progress-meta" id="progressMeta" style="display:none">
+      <span class="left"  id="progressLeft"></span>
+      <span class="right" id="progressRight"></span>
+    </div>
+  </div>
+
+  <div id="result" style="display:none">
+    <h2>Transcript</h2>
+    <div class="row" id="downloads"></div>
+    <pre id="text"></pre>
+  </div>
+
+<script>
+  const drop = document.getElementById('drop');
+  const fileInput = document.getElementById('file');
+  const fileName = document.getElementById('fileName');
+  const goBtn = document.getElementById('go');
+  const statusBox = document.getElementById('status');
+  const spinnerEl = document.getElementById('spinner');
+  const progressMsg = document.getElementById('progressMsg');
+  const progressBar = document.getElementById('progressBar');
+  const progressFill = document.getElementById('progressFill');
+  const progressMeta = document.getElementById('progressMeta');
+  const progressLeft = document.getElementById('progressLeft');
+  const progressRight = document.getElementById('progressRight');
+  const resultBox = document.getElementById('result');
+  const downloads = document.getElementById('downloads');
+  const textBox = document.getElementById('text');
+  const readyPill = document.getElementById('readyPill');
+  const readyText = document.getElementById('readyText');
+  let chosenFile = null;
+
+  function fmtTime(s) {
+    s = Math.max(0, Math.round(s));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return sec ? `${m}m ${sec}s` : `${m}m`;
+  }
+
+  async function checkReady() {
+    try {
+      const r = await fetch('/ready');
+      const j = await r.json();
+      if (j.ready) {
+        readyPill.classList.add('ok');
+        readyText.textContent = 'model ready';
+        return true;
+      } else {
+        readyText.textContent = `model loading… ${fmtTime(j.elapsed_sec || 0)}`;
+      }
+    } catch (_) {}
+    return false;
+  }
+  (async () => {
+    while (!(await checkReady())) {
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  })();
+
+  function showFile(f) {
+    chosenFile = f;
+    fileName.textContent = f
+      ? `Selected: ${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`
+      : '';
+    goBtn.disabled = !f;
+  }
+
+  fileInput.addEventListener('change', e => {
+    if (e.target.files.length) showFile(e.target.files[0]);
+  });
+
+  ['dragenter', 'dragover'].forEach(ev =>
+    drop.addEventListener(ev, e => {
+      e.preventDefault(); drop.classList.add('hover');
+    }));
+  ['dragleave', 'drop'].forEach(ev =>
+    drop.addEventListener(ev, e => {
+      e.preventDefault(); drop.classList.remove('hover');
+    }));
+  drop.addEventListener('drop', e => {
+    if (e.dataTransfer.files.length) showFile(e.dataTransfer.files[0]);
+  });
+
+  goBtn.addEventListener('click', async () => {
+    if (!chosenFile) return;
+    goBtn.disabled = true;
+    resultBox.style.display = 'none';
+    showProgress({ status: 'uploading', progress: 'Uploading file...' });
+    const fd = new FormData();
+    fd.append('file', chosenFile);
+    try {
+      const r = await fetch('/transcribe', { method: 'POST', body: fd });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'Upload failed');
+      poll(data.job_id);
+    } catch (err) {
+      showProgress({ status: 'error', error: err.message });
+      goBtn.disabled = false;
+    }
+  });
+
+  function showProgress(j) {
+    statusBox.style.display = 'block';
+    const isErr  = j.status === 'error';
+    const isDone = j.status === 'done';
+    statusBox.className = 'status' + (isErr ? ' err' : isDone ? ' done' : '');
+
+    spinnerEl.style.display = (isErr || isDone) ? 'none' : 'inline-block';
+
+    if (isErr) {
+      progressMsg.textContent = 'Error: ' + (j.error || 'Unknown');
+      progressBar.style.display = 'none';
+      progressMeta.style.display = 'none';
+      return;
+    }
+    if (isDone) {
+      progressMsg.textContent = `Done — ${j.segment_count} segments.`;
+      progressFill.classList.remove('indeterminate');
+      progressFill.style.width = '100%';
+      progressBar.style.display = 'block';
+      progressMeta.style.display = 'flex';
+      progressLeft.textContent  = `Elapsed: ${fmtTime(j.elapsed_sec || 0)}`;
+      progressRight.textContent = '';
+      return;
+    }
+
+    progressMsg.textContent = j.progress || j.status || 'Working...';
+
+    const elapsed   = j.elapsed_sec;
+    const estimated = j.estimated_total_sec;
+
+    if (elapsed != null && estimated) {
+      const pct = Math.min(99, (elapsed / estimated) * 100);
+      progressFill.classList.remove('indeterminate');
+      progressFill.style.width = pct.toFixed(1) + '%';
+      progressBar.style.display = 'block';
+      progressMeta.style.display = 'flex';
+      progressLeft.textContent  = `Elapsed: ${fmtTime(elapsed)}`;
+      const remaining = Math.max(0, estimated - elapsed);
+      progressRight.textContent = remaining > 0
+        ? `~${fmtTime(remaining)} remaining`
+        : 'finishing up…';
+    } else if (elapsed != null) {
+      // Indeterminate stage (model load / extracting / writing) — show animated bar + elapsed.
+      progressFill.classList.add('indeterminate');
+      progressFill.style.width = '35%';
+      progressBar.style.display = 'block';
+      progressMeta.style.display = 'flex';
+      progressLeft.textContent  = `Elapsed: ${fmtTime(elapsed)}`;
+      progressRight.textContent = '';
+    } else {
+      progressBar.style.display = 'none';
+      progressMeta.style.display = 'none';
+    }
+  }
+
+  async function poll(jobId) {
+    while (true) {
+      let j;
+      try {
+        const r = await fetch('/status/' + jobId);
+        j = await r.json();
+      } catch (e) {
+        showProgress({ status: 'error', error: 'Lost connection to server.' });
+        goBtn.disabled = false;
+        return;
+      }
+      showProgress(j);
+      if (j.status === 'done') {
+        showResult(jobId, j);
+        goBtn.disabled = false;
+        return;
+      }
+      if (j.status === 'error') {
+        goBtn.disabled = false;
+        return;
+      }
+      // Faster polling during transcription for smooth progress; slower for short stages.
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+
+  function showResult(jobId, j) {
+    resultBox.style.display = 'block';
+    textBox.textContent = j.text || '';
+    downloads.innerHTML = ['txt', 'srt', 'vtt', 'json']
+      .map(f => `<a href="/download/${jobId}/${f}">Download .${f}</a>`)
+      .join('');
+  }
+</script>
+</body>
+</html>

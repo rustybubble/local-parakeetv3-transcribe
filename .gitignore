@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local Claude Code config (machine-specific paths/permissions)
+.claude/
+
+# App runtime output
+transcripts/
+
+# Media files — this is a transcription tool, so test recordings live here
+# but should never be checked in
+*.mkv
+*.mp4
+*.mov
+*.avi
+*.webm
+*.m4v
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.aac
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
